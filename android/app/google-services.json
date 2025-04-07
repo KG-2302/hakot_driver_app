@@ -1,0 +1,23 @@
+{
+  "project_info": {
+    "project_number": "282606665688",
+    "firebase_url": "https://strp-1cbd6-default-rtdb.firebaseio.com",
+    "project_id": "strp-1cbd6"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:282606665688:android:a2d7167a7211f2653fbcad",
+        "android_client_info": {
+          "package_name": "com.example.hakot_mobile_app"
+        }
+      },
+      "api_key": [
+        {
+          "current_key": "AIzaSyDCqxkMR-TmIgV8YKbFpdKUdtY7vPetz9k"
+        }
+      ]
+    }
+  ],
+  "configuration_version": "1"
+}

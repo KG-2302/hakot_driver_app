@@ -1,0 +1,17 @@
+/* Visit https://firebase.google.com/docs/database/security to learn more about security rules. */
+{
+  "rules": {
+    "trucks": {
+      "$truckKey": {
+        ".read": "auth != null",
+        ".write": "auth != null",
+        "schedules": {
+          ".validate": "newData.hasChildren(['week'])"
+        }
+      }
+    },
+    "users": {
+      ".indexOn": ["name"]
+    }
+  }
+}
