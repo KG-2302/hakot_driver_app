@@ -926,6 +926,7 @@ class _MapScreenState extends State<MapScreen> {
         tooltip: "Finish Travel and Submit Report",
       );
     }
+
     // When not in a final stage and travel is active with routing on.
     if (isTraveling && isRoutingStarted) {
       return FloatingActionButton(
