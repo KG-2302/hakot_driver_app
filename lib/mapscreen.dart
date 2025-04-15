@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:hakot_driver_app/assignedroutes.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
@@ -13,6 +14,7 @@ import 'package:flutter/services.dart';
 
 /// Widget to measure the size of its child and report it via a callback.
 typedef OnWidgetSizeChange = void Function(Size size);
+
 class MeasureSize extends StatefulWidget {
   final Widget child;
   final OnWidgetSizeChange onChange;
@@ -73,6 +75,7 @@ class _MapScreenState extends State<MapScreen> {
   Duration travelDuration = Duration.zero;
   bool isTraveling = false;
   double? startupFuel;
+  double? startupOdometer; // New variable to store the odometer reading
 
   // Distance traveled.
   double _metersTraveled = 0.0;
@@ -130,10 +133,8 @@ class _MapScreenState extends State<MapScreen> {
 
   /// Fetch the truck type from Firebase.
   Future<void> _fetchTruckType() async {
-    DatabaseReference truckRef = FirebaseDatabase.instance
-        .ref()
-        .child('trucks')
-        .child(widget.truckId);
+    DatabaseReference truckRef =
+    FirebaseDatabase.instance.ref().child('trucks').child(widget.truckId);
     final snapshot = await truckRef.get();
     if (snapshot.exists && snapshot.value is Map) {
       final truckData =
@@ -496,8 +497,7 @@ class _MapScreenState extends State<MapScreen> {
         );
         setState(() {
           _targetLocation = destination;
-          _targetLocationName =
-              nextDest["name"] ?? "Unknown Destination";
+          _targetLocationName = nextDest["name"] ?? "Unknown Destination";
         });
         await _updateDynamicRoute(currentLocation!, destination);
         if (!isTraveling) {
@@ -510,12 +510,24 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
+  /// Updated _toggleGPSTracking prevents turning off GPS when travel is active.
   Future<void> _toggleGPSTracking() async {
     setState(() {
       _isGpsLoading = true;
     });
     try {
+      // If tracking is active...
       if (isTracking) {
+        // ...and travel is on, do not allow turning off GPS.
+        if (isTraveling) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text("Cannot turn off GPS while travel is active. Stop travel first."),
+            ),
+          );
+          return;
+        }
+        // Otherwise, allow turning off GPS
         await _positionStreamSubscription?.cancel();
         await fb.FlutterBackground.disableBackgroundExecution();
         setState(() {
@@ -526,6 +538,7 @@ class _MapScreenState extends State<MapScreen> {
           const SnackBar(content: Text("Location turned OFF")),
         );
       } else {
+        // Turning on the GPS as before.
         LocationPermission permission = await Geolocator.checkPermission();
         if (permission == LocationPermission.denied ||
             permission == LocationPermission.deniedForever) {
@@ -588,15 +601,13 @@ class _MapScreenState extends State<MapScreen> {
                 } else {
                   int nearestIndex =
                   _getNearestDestinationIndex(currentLocation!, _displayLocations);
-                  Map<String, dynamic> nearestDest =
-                  _displayLocations[nearestIndex];
+                  Map<String, dynamic> nearestDest = _displayLocations[nearestIndex];
                   LatLng destLatLng = LatLng(
                     nearestDest['latitude'] as double,
                     nearestDest['longitude'] as double,
                   );
                   double distance = Distance().as(
                       LengthUnit.Meter, currentLocation!, destLatLng);
-                  // Debug print the current distance and remaining destinations.
                   print("Distance to destination: $distance meters. Remaining destinations: ${_displayLocations.length}");
                   if (distance < 50) {
                     // Mark destination as completed.
@@ -604,10 +615,8 @@ class _MapScreenState extends State<MapScreen> {
                     setState(() {
                       _displayLocations.removeAt(nearestIndex);
                     });
-                    // Debug print after removal.
                     print("Destination removed. Remaining: ${_displayLocations.length}");
                     if (_displayLocations.isEmpty) {
-                      // All destinations reached.
                       print("All destinations reached, routing to landfill");
                       setState(() {
                         finalStage = "landfill";
@@ -621,16 +630,14 @@ class _MapScreenState extends State<MapScreen> {
                     } else {
                       int newNearestIndex =
                       _getNearestDestinationIndex(currentLocation!, _displayLocations);
-                      Map<String, dynamic> newDest =
-                      _displayLocations[newNearestIndex];
+                      Map<String, dynamic> newDest = _displayLocations[newNearestIndex];
                       LatLng newDestLatLng = LatLng(
                         newDest['latitude'] as double,
                         newDest['longitude'] as double,
                       );
                       setState(() {
                         _targetLocation = newDestLatLng;
-                        _targetLocationName =
-                            newDest["name"] ?? "Unknown Destination";
+                        _targetLocationName = newDest["name"] ?? "Unknown Destination";
                       });
                       await _updateDynamicRoute(currentLocation!, newDestLatLng);
                     }
@@ -654,19 +661,23 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  /// Starts travel by prompting for "Fuel Loaded" and "Odometer Reading"
+  /// using a custom centered modal dialog.
   Future<void> _startTravel() async {
     setState(() {
       _isTravelLoading = true;
     });
-    double? fuel = await _showFuelDialog("Enter Startup Fuel (liters)");
-    if (fuel == null) {
+    // Use the custom centered dialog prompt.
+    final result = await showFuelAndOdometerDialog(context);
+    if (result == null) {
       setState(() {
         _isTravelLoading = false;
       });
       return;
     }
-    startupFuel = fuel;
-    await fb.FlutterBackground.enableBackgroundExecution();
+    startupFuel = result['fuel'];
+    startupOdometer = result['odometer']; // Save the odometer reading
+
     setState(() {
       isTraveling = true;
       travelDuration = Duration.zero;
@@ -684,6 +695,7 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   /// Stops travel and submits a report.
+  /// The report now includes the initially entered odometer reading.
   Future<void> _stopTravelAndSubmitReport() async {
     _travelTimer?.cancel();
     setState(() {
@@ -691,18 +703,14 @@ class _MapScreenState extends State<MapScreen> {
     });
     await fb.FlutterBackground.disableBackgroundExecution();
 
-    double? remainingFuel =
-    await _showFuelDialog("Enter Remaining Fuel (liters)");
-    if (remainingFuel == null) return;
-
-    double fuelUsed = (startupFuel ?? 0) - remainingFuel;
+    // Use the initially loaded fuel.
+    double fuelUsed = startupFuel ?? 0;
     double kilometersTraveled = _metersTraveled / 1000;
 
     if (_disposedWeight == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
-            content: Text(
-                "Please enter disposed trash weight using the trash icon.")),
+            content: Text("Please enter disposed trash weight using the trash icon.")),
       );
       return;
     }
@@ -712,6 +720,7 @@ class _MapScreenState extends State<MapScreen> {
       'date': DateTime.now().toIso8601String(),
       'timeTravel': travelDuration.inSeconds,
       'fuelUsed': fuelUsed,
+      'odometerReading': startupOdometer, // Include the odometer reading.
       'disposedTrashWeight': _disposedWeight,
       'kilometersTraveled': kilometersTraveled,
     };
@@ -726,10 +735,13 @@ class _MapScreenState extends State<MapScreen> {
       const SnackBar(content: Text("Travel report submitted")),
     );
 
+    // Reset variables for the next travel session.
     setState(() {
       _disposedWeight = null;
       travelDuration = Duration.zero;
       _metersTraveled = 0;
+      startupFuel = null;
+      startupOdometer = null;
     });
   }
 
@@ -788,52 +800,65 @@ class _MapScreenState extends State<MapScreen> {
       });
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-            content:
-            Text("Disposed Trash Weight updated to $_disposedWeight kg")),
+            content: Text("Disposed Trash Weight updated to $_disposedWeight kg")),
       );
     }
   }
 
-  Future<double?> _showFuelDialog(String title) async {
-    TextEditingController controller = TextEditingController();
-    double? result;
-    await showDialog(
-      context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: Text(title),
-          content: TextField(
-            controller: controller,
-            keyboardType:
-            const TextInputType.numberWithOptions(decimal: true),
-            inputFormatters: [
-              FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$'))
-            ],
-            decoration: const InputDecoration(hintText: "Enter value"),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text("Cancel"),
-            ),
-            TextButton(
-              onPressed: () {
-                if (controller.text.isEmpty) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Please enter a value.")),
-                  );
-                  return;
-                }
-                result = double.tryParse(controller.text);
-                Navigator.pop(context);
-              },
-              child: const Text("OK"),
-            ),
-          ],
-        );
-      },
-    );
-    return result;
+  /// Build the floating button based on current state.
+  Widget _buildFloatingButtons() {
+    // When in final stage "landfill", show the trash icon to complete final trash input.
+    if (finalStage == "landfill") {
+      return FloatingActionButton(
+        onPressed: () async {
+          await _handleFinalTrashInputAndRouteToMotorpool();
+        },
+        child: const Icon(Icons.delete, color: Colors.white),
+        backgroundColor: Colors.green,
+        tooltip: "Enter Trash Weight at Landfill",
+      );
+    }
+    // When in final stage "motorpool", show the check icon.
+    if (finalStage == "motorpool") {
+      return FloatingActionButton(
+        onPressed: () async {
+          await _stopTravelAndSubmitReport();
+          Navigator.of(context).pop(true);
+        },
+        child: const Icon(Icons.check, color: Colors.white),
+        backgroundColor: Colors.green,
+        tooltip: "Stop Travel",
+      );
+    }
+    // When not in a final stage and travel is active with routing on.
+    if (isTraveling && isRoutingStarted) {
+      return FloatingActionButton(
+        onPressed: () async {
+          if (_showTrashInput) {
+            // Trash icon is showing: input trash weight then revert back.
+            await _handleLandfillTrashInput();
+            setState(() {
+              _showTrashInput = false;
+            });
+          } else {
+            // Truck icon pressed: mark truck as full and toggle the icon.
+            setState(() {
+              _showTrashInput = true;
+            });
+            await _handleTruckFull();
+          }
+        },
+        child: Icon(
+          _showTrashInput ? Icons.delete : Icons.local_shipping,
+          color: Colors.white,
+        ),
+        backgroundColor: _showTrashInput ? Colors.green : Colors.red,
+        tooltip: _showTrashInput
+            ? "Enter Trash Weight at Landfill"
+            : "Truck is Full – route to Landfill",
+      );
+    }
+    return Container();
   }
 
   /// New method to handle when the truck is full.
@@ -899,65 +924,6 @@ class _MapScreenState extends State<MapScreen> {
     });
   }
 
-  /// New method to finalize travel.
-  Future<void> _finishTravel() async {
-    await _stopTravelAndSubmitReport();
-  }
-
-  /// Build a floating button based on the current state.
-  Widget _buildFloatingButtons() {
-    // When in final stage "landfill", show the trash icon to complete final trash input.
-    if (finalStage == "landfill") {
-      return FloatingActionButton(
-        onPressed: () async {
-          await _handleFinalTrashInputAndRouteToMotorpool();
-        },
-        child: const Icon(Icons.delete, color: Colors.white),
-        backgroundColor: Colors.green,
-        tooltip: "Enter Trash Weight at Landfill",
-      );
-    }
-    // When in final stage "motorpool", show the check icon to finish travel.
-    if (finalStage == "motorpool") {
-      return FloatingActionButton(
-        onPressed: _finishTravel,
-        child: const Icon(Icons.check, color: Colors.white),
-        backgroundColor: Colors.blue,
-        tooltip: "Finish Travel and Submit Report",
-      );
-    }
-
-    // When not in a final stage and travel is active with routing on.
-    if (isTraveling && isRoutingStarted) {
-      return FloatingActionButton(
-        onPressed: () async {
-          if (_showTrashInput) {
-            // Trash icon is currently showing: input trash weight then revert back.
-            await _handleLandfillTrashInput();
-            setState(() {
-              _showTrashInput = false;
-            });
-          } else {
-            // Truck icon pressed: mark truck as full and toggle the icon.
-            setState(() {
-              _showTrashInput = true;
-            });
-            await _handleTruckFull();
-          }
-        },
-        child: Icon(
-          _showTrashInput ? Icons.delete : Icons.local_shipping,
-          color: Colors.white,
-        ),
-        backgroundColor: _showTrashInput ? Colors.green : Colors.red,
-        tooltip: _showTrashInput
-            ? "Enter Trash Weight at Landfill"
-            : "Truck is Full – route to Landfill",
-      );
-    }
-    return Container();
-  }
-
   @override
   void dispose() {
     _positionStreamSubscription?.cancel();
@@ -978,7 +944,7 @@ class _MapScreenState extends State<MapScreen> {
         height: 40,
         child: GestureDetector(
           onLongPress: () async {
-            // First mark the destination as completed in Firebase.
+            // Mark destination as completed in Firebase.
             await _markDestinationAsCompleted(location);
             setState(() {
               _displayLocations.remove(location);
@@ -1002,8 +968,7 @@ class _MapScreenState extends State<MapScreen> {
                 });
                 await _updateDynamicRoute(currentLocation!, newDestLatLng);
               } else {
-                // Here we detect that all pins have been removed,
-                // so we simulate the final stage activation.
+                // When all pins are removed, simulate final stage activation.
                 setState(() {
                   isRoutingStarted = false;
                   routePoints = [];
@@ -1014,7 +979,8 @@ class _MapScreenState extends State<MapScreen> {
                 });
                 await _updateDynamicRoute(currentLocation!, landfillLatLng);
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(content: Text("All destinations reached. Routing to Landfill.")),
+                  const SnackBar(
+                      content: Text("All destinations reached. Routing to Landfill.")),
                 );
               }
             }
@@ -1122,13 +1088,13 @@ class _MapScreenState extends State<MapScreen> {
                 child: Row(
                   children: [
                     IconButton(
-                      icon: const Icon(Icons.arrow_back, color: Colors.green),
+                      icon:
+                      const Icon(Icons.arrow_back, color: Colors.green),
                       onPressed: () {
                         if (isTraveling) {
                           ScaffoldMessenger.of(context).showSnackBar(
                             const SnackBar(
-                                content: Text(
-                                    "Travel mode is active. Back button disabled.")),
+                                content: Text("Travel mode is active. Back button disabled.")),
                           );
                         } else {
                           Navigator.of(context).pop(true);
@@ -1144,8 +1110,7 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                     ),
                     IconButton(
-                      icon:
-                      const Icon(Icons.my_location, color: Colors.blue),
+                      icon: const Icon(Icons.my_location, color: Colors.blue),
                       onPressed: _recenterMap,
                     ),
                   ],
@@ -1325,4 +1290,124 @@ class _MapScreenState extends State<MapScreen> {
       ),
     );
   }
+}
+
+/// Custom centered modal dialog prompt for fuel loaded and odometer reading.
+/// It mimics the design of your "Truck Details" header with a gradient background.
+Future<Map<String, double>?> showFuelAndOdometerDialog(BuildContext context) async {
+  final TextEditingController fuelController = TextEditingController();
+  final TextEditingController odoController = TextEditingController();
+
+  return await showDialog<Map<String, double>>(
+    context: context,
+    barrierDismissible: false, // User must tap the button to dismiss.
+    builder: (context) {
+      return AlertDialog(
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+        ),
+        contentPadding: EdgeInsets.zero,
+        content: SingleChildScrollView(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                padding: const EdgeInsets.all(18),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [Colors.green.shade600, Colors.green.shade400],
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                  ),
+                  borderRadius: const BorderRadius.only(
+                    topLeft: Radius.circular(20),
+                    topRight: Radius.circular(20),
+                  ),
+                ),
+                child: Row(
+                  children: [
+                    const Icon(Icons.local_shipping, color: Colors.white, size: 28),
+                    const SizedBox(width: 8),
+                    const Expanded(
+                      child: Text(
+                        "Enter Truck Details",
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 20,
+                          fontWeight: FontWeight.bold,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                    ),
+                    GestureDetector(
+                      onTap: () {
+                        Navigator.of(context).pop();
+                      },
+                      child: const Icon(Icons.close, color: Colors.white),
+                    ),
+                  ],
+                ),
+              ),
+              // Content area with prompt fields.
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
+                child: Column(
+                  children: [
+                    TextField(
+                      controller: fuelController,
+                      decoration: InputDecoration(
+                        labelText: "Fuel Loaded (liters)",
+                        prefixIcon: Icon(Icons.local_gas_station, color: Colors.green.shade400, size: 28),
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$')),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    TextField(
+                      controller: odoController,
+                      decoration: InputDecoration(
+                        labelText: "Odometer Reading",
+                        prefixIcon: Icon(Icons.speed, color: Colors.green.shade400, size: 28),
+                      ),
+                      keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                      inputFormatters: [
+                        FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$')),
+                      ],
+                    ),
+                    const SizedBox(height: 16),
+                    ElevatedButton(
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.green.shade400,
+                          foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                      onPressed: () {
+                        final fuelValue = double.tryParse(fuelController.text);
+                        final odoValue = double.tryParse(odoController.text);
+                        if (fuelValue != null && odoValue != null) {
+                          Navigator.of(context).pop({
+                            'fuel': fuelValue,
+                            'odometer': odoValue,
+                          });
+                        } else {
+                          ScaffoldMessenger.of(context).showSnackBar(
+                            const SnackBar(content: Text("Please enter valid values.")),
+                          );
+                        }
+                      },
+                      child: const Text("Submit"),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    },
+  );
 }
