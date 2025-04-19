@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:hakot_driver_app/assignedroutes.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:http/http.dart' as http;
 import 'package:geolocator/geolocator.dart';
@@ -37,7 +36,6 @@ class _MeasureSizeState extends State<MeasureSize> {
   }
 
   void _notifySize() {
-    final context = this.context;
     if (!mounted) return;
     final Size newSize = context.size ?? Size.zero;
     widget.onChange(newSize);
@@ -47,9 +45,9 @@ class _MeasureSizeState extends State<MeasureSize> {
 class MapScreen extends StatefulWidget {
   final String day;
   final List<Map<String, dynamic>> locations;
-  // For reporting purposes:
-  final String truckName; // Only truck name (without plate) will be used.
-  final String truckId; // The truck's Firebase key.
+  final String truckName;       // Only truck name (without plate).
+  final String truckId;         // The truck's Firebase key.
+  final String driverFullName;  // Needed to query schedules by driver.
 
   const MapScreen({
     Key? key,
@@ -57,6 +55,7 @@ class MapScreen extends StatefulWidget {
     required this.locations,
     required this.truckName,
     required this.truckId,
+    required this.driverFullName,
   }) : super(key: key);
 
   @override
@@ -64,60 +63,42 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
-  // Existing state variables.
   List<LatLng> routePoints = [];
   bool isTracking = false;
+  bool isTraveling = false;
+  bool isRoutingStarted = false;
+
   StreamSubscription<Position>? _positionStreamSubscription;
   LatLng? currentLocation;
+  LatLng? _lastTravelLocation;
+  LatLng? _targetLocation;
 
-  // Travel Timer variables.
   Timer? _travelTimer;
   Duration travelDuration = Duration.zero;
-  bool isTraveling = false;
+
   double? startupFuel;
-  double? startupOdometer; // New variable to store the odometer reading
-
-  // Distance traveled.
+  double? startupOdometer;
   double _metersTraveled = 0.0;
-  LatLng? _lastTravelLocation;
+  double? _disposedWeight;
 
-  // Routing variables.
-  bool isRoutingStarted = false;
-  late List<Map<String, dynamic>> _displayLocations;
+  bool _showTrashInput = false;
+  bool isTruckFull = false;
+  bool isAtLandfill = false;
+  String? finalStage;
+  String? _targetLocationName;
+  String _locationName = "Loading Current Location...";
+
+  List<Map<String, dynamic>> _displayLocations = [];
   List<List<LatLng>> alternativeRoutes = [];
 
-  // Loading flags.
   bool _isGpsLoading = false;
   bool _isTravelLoading = false;
   bool _isRouteLoading = false;
 
-  // Reverse geocoding location name.
-  String _locationName = "Loading Current Location...";
-
-  // Dynamic routing target.
-  LatLng? _targetLocation;
-  String? _targetLocationName;
-
-  // Disposed trash weight.
-  double? _disposedWeight;
-
-  // Truck type (for custom marker).
-  String truckType = 'default';
-
-  // Used to adjust overlay position.
   double _bottomOverlayHeight = 0;
 
-  // New state variables for the landfill process.
-  bool isTruckFull = false;
-  bool isAtLandfill = false;
-  // Toggle between truck and trash icons during travel.
-  bool _showTrashInput = false;
-  // Final stage variable: "landfill" means route to landfill; "motorpool" means route to motorpool.
-  String? finalStage;
-
-  // Landfill coordinates (7°30'24.0"N, 125°49'05.2"E).
+  String truckType = 'default';
   final LatLng landfillLatLng = LatLng(7.506667, 125.818111);
-  // Motorpool coordinates (7.4493° N, 125.8255° E).
   final LatLng motorpoolLatLng = LatLng(7.4493, 125.8255);
 
   final MapController _mapController = MapController();
@@ -147,23 +128,14 @@ class _MapScreenState extends State<MapScreen> {
 
   /// Check for an active data connection.
   Future<bool> _checkConnectivity() async {
-    List<ConnectivityResult> results =
-    await Connectivity().checkConnectivity();
-    return results.any((result) => result != ConnectivityResult.none);
+    var result = await Connectivity().checkConnectivity();
+    return result != ConnectivityResult.none;
   }
 
   /// If there are at least two destinations, fetch the full route.
   void _initRoute() async {
-    if (_displayLocations.length >= 2) {
-      bool connected = await _checkConnectivity();
-      if (connected) {
-        await _fetchRoute();
-      } else {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-              content: Text("No data connection. Cannot fetch full route.")),
-        );
-      }
+    if (_displayLocations.length >= 2 && await _checkConnectivity()) {
+      await _fetchRoute();
     }
   }
 
@@ -174,60 +146,39 @@ class _MapScreenState extends State<MapScreen> {
       notificationIcon:
       fb.AndroidResource(name: 'ic_launcher', defType: 'mipmap'),
     );
-    bool initialized =
     await fb.FlutterBackground.initialize(androidConfig: androidConfig);
-    print("Background execution initialized: $initialized");
   }
 
   /// Reverse geocoding via ORS.
   Future<void> _updateLocationName() async {
-    if (currentLocation != null) {
-      if (!await _checkConnectivity()) {
-        setState(() {
-          _locationName = "No data connection";
-        });
-        return;
+    if (currentLocation == null) return;
+    if (!await _checkConnectivity()) {
+      setState(() => _locationName = "No data connection");
+      return;
+    }
+    try {
+      final url =
+          "https://api.openrouteservice.org/geocode/reverse?api_key=$openRouteServiceApiKey"
+          "&point.lat=${currentLocation!.latitude}&point.lon=${currentLocation!.longitude}&size=1";
+      final response = await http.get(Uri.parse(url));
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+        final label = data["features"]?[0]?["properties"]?["label"];
+        setState(() => _locationName = label ?? "Unknown location");
+      } else {
+        setState(() => _locationName = "Unknown location");
       }
-      try {
-        final url =
-            "https://api.openrouteservice.org/geocode/reverse?api_key=$openRouteServiceApiKey&point.lat=${currentLocation!.latitude}&point.lon=${currentLocation!.longitude}&size=1";
-        final response = await http.get(Uri.parse(url));
-        if (response.statusCode == 200) {
-          final data = jsonDecode(response.body);
-          if (data["features"] != null && data["features"].isNotEmpty) {
-            String label =
-                data["features"][0]["properties"]["label"] ?? "Unknown location";
-            setState(() {
-              _locationName = label;
-            });
-          } else {
-            setState(() {
-              _locationName = "Unknown location";
-            });
-          }
-        } else {
-          setState(() {
-            _locationName = "Unknown location";
-          });
-        }
-      } catch (e) {
-        setState(() {
-          _locationName = "Error retrieving location";
-        });
-      }
+    } catch (_) {
+      setState(() => _locationName = "Error retrieving location");
     }
   }
 
   String _formatDuration(Duration d) {
-    String twoDigits(int n) => n.toString().padLeft(2, '0');
-    final hours = d.inHours;
-    final minutes = d.inMinutes.remainder(60);
-    final seconds = d.inSeconds.remainder(60);
-    if (hours > 0) {
-      return "${twoDigits(hours)}:${twoDigits(minutes)}:${twoDigits(seconds)}";
-    } else {
-      return "${twoDigits(minutes)}:${twoDigits(seconds)}";
+    String two(int n) => n.toString().padLeft(2, '0');
+    if (d.inHours > 0) {
+      return "${two(d.inHours)}:${two(d.inMinutes.remainder(60))}:${two(d.inSeconds.remainder(60))}";
     }
+    return "${two(d.inMinutes)}:${two(d.inSeconds.remainder(60))}";
   }
 
   int _getNearestDestinationIndex(
@@ -259,214 +210,146 @@ class _MapScreenState extends State<MapScreen> {
   Future<void> _fetchRoute() async {
     if (!await _checkConnectivity()) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text("No data connection. Please check your network.")),
+        const SnackBar(content: Text("No data connection.")),
       );
       return;
     }
-    List<List<double>> coordinates = _displayLocations.map((location) {
-      return [location['longitude'] as double, location['latitude'] as double];
-    }).toList();
-
-    final url = Uri.parse(
-        'https://api.openrouteservice.org/v2/directions/driving-car/geojson');
-    final body = jsonEncode({'coordinates': coordinates});
-    try {
-      final response = await http.post(
-        url,
-        headers: {
-          'Authorization': openRouteServiceApiKey,
-          'Content-Type': 'application/json',
-        },
-        body: body,
-      );
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['features'] != null && data['features'].isNotEmpty) {
-          final geometry = data['features'][0]['geometry'];
-          if (geometry != null &&
-              geometry['type'] == 'LineString' &&
-              geometry['coordinates'] is List) {
-            List<dynamic> coords = geometry['coordinates'];
-            List<LatLng> points = coords.map<LatLng>((coord) {
-              return LatLng(coord[1] as double, coord[0] as double);
-            }).toList();
-            setState(() {
-              routePoints = points;
-            });
-          }
-        }
-      } else {
-        print('ORS error: ${response.statusCode} ${response.body}');
+    final coords = _displayLocations
+        .map((loc) => [loc['longitude'] as double, loc['latitude'] as double])
+        .toList();
+    final response = await http.post(
+      Uri.parse('https://api.openrouteservice.org/v2/directions/driving-car/geojson'),
+      headers: {
+        'Authorization': openRouteServiceApiKey,
+        'Content-Type': 'application/json',
+      },
+      body: jsonEncode({'coordinates': coords}),
+    );
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      final geometry = data['features']?[0]?['geometry'];
+      if (geometry?['type'] == 'LineString') {
+        final coordsList = geometry['coordinates'] as List;
+        final points = coordsList
+            .map<LatLng>((c) => LatLng(c[1] as double, c[0] as double))
+            .toList();
+        setState(() => routePoints = points);
       }
-    } catch (e) {
-      print("Error fetching route: $e");
     }
   }
 
   /// Updates the dynamic route from start to destination.
-  Future<void> _updateDynamicRoute(
-      LatLng start, LatLng destination) async {
+  Future<void> _updateDynamicRoute(LatLng start, LatLng destination) async {
     if (!await _checkConnectivity()) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text("No data connection. Please check your network.")),
+        const SnackBar(content: Text("No data connection.")),
       );
       return;
     }
-    final url = Uri.parse(
-        'https://api.openrouteservice.org/v2/directions/driving-car/geojson');
-    Map<String, dynamic> bodyMap = {
+    final body = jsonEncode({
       "coordinates": [
         [start.longitude, start.latitude],
         [destination.longitude, destination.latitude]
       ],
       "preference": "shortest",
       "alternative_routes": {"share_factor": 0.6, "target_count": 3}
-    };
-    final body = jsonEncode(bodyMap);
-    try {
-      final response = await http.post(
-        url,
-        headers: {
-          'Authorization': openRouteServiceApiKey,
-          'Content-Type': 'application/json',
-        },
-        body: body,
-      );
-      if (response.statusCode == 200) {
-        final data = jsonDecode(response.body);
-        if (data['features'] != null && data['features'].isNotEmpty) {
-          final geometry = data['features'][0]['geometry'];
-          if (geometry != null &&
-              geometry['type'] == 'LineString' &&
-              geometry['coordinates'] is List) {
-            List<dynamic> coords = geometry['coordinates'];
-            List<LatLng> mainRoute = coords.map<LatLng>((coord) {
-              return LatLng(coord[1] as double, coord[0] as double);
-            }).toList();
-            setState(() {
-              routePoints = mainRoute;
-            });
-          }
-          if (data['features'].length > 1) {
-            List<List<LatLng>> alternatives = [];
-            for (int i = 1; i < data['features'].length; i++) {
-              final altGeometry = data['features'][i]['geometry'];
-              if (altGeometry != null &&
-                  altGeometry['type'] == 'LineString' &&
-                  altGeometry['coordinates'] is List) {
-                List<dynamic> altCoords = altGeometry['coordinates'];
-                List<LatLng> altRoute = altCoords.map<LatLng>((coord) {
-                  return LatLng(coord[1] as double, coord[0] as double);
-                }).toList();
-                alternatives.add(altRoute);
-              }
-            }
-            setState(() {
-              alternativeRoutes = alternatives;
-            });
-          } else {
-            setState(() {
-              alternativeRoutes = [];
-            });
-          }
-        }
-      } else {
-        print('ORS error: ${response.statusCode} ${response.body}');
+    });
+    final response = await http.post(
+      Uri.parse('https://api.openrouteservice.org/v2/directions/driving-car/geojson'),
+      headers: {
+        'Authorization': openRouteServiceApiKey,
+        'Content-Type': 'application/json',
+      },
+      body: body,
+    );
+    if (response.statusCode == 200) {
+      final data = jsonDecode(response.body);
+      final features = data['features'] as List;
+      if (features.isNotEmpty) {
+        final mainGeo = features[0]['geometry'];
+        final coordsList = mainGeo['coordinates'] as List;
+        final mainRoute = coordsList
+            .map<LatLng>((c) => LatLng(c[1] as double, c[0] as double))
+            .toList();
+        setState(() => routePoints = mainRoute);
       }
-    } catch (e) {
-      print("Error fetching dynamic route: $e");
+      if (features.length > 1) {
+        final alts = <List<LatLng>>[];
+        for (int i = 1; i < features.length; i++) {
+          final geo = features[i]['geometry'];
+          final coordsList = geo['coordinates'] as List;
+          alts.add(coordsList
+              .map<LatLng>((c) => LatLng(c[1] as double, c[0] as double))
+              .toList());
+        }
+        setState(() => alternativeRoutes = alts);
+      } else {
+        setState(() => alternativeRoutes = []);
+      }
     }
   }
 
-  /// Marks a destination as completed in Firebase.
-  Future<void> _markDestinationAsCompleted(
-      Map<String, dynamic> destination) async {
+  /// Marks a destination as completed in Firebase using the same logic as AssignedRoutes.
+  Future<void> _markDestinationAsCompleted(Map<String, dynamic> destination) async {
     try {
-      DatabaseReference dayRef = FirebaseDatabase.instance
+      final daysOrder = [
+        "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"
+      ];
+      final currentDay = daysOrder[ DateTime.now().weekday - 1 ];
+
+      // 1) Query by driverFullName
+      final truckQuery = FirebaseDatabase.instance
           .ref()
           .child('trucks')
-          .child(widget.truckId)
+          .orderByChild('vehicleDriver')
+          .equalTo(widget.driverFullName);
+      final truckSnap = await truckQuery.get();
+      if (!truckSnap.exists) return;
+
+      final truckKey = truckSnap.children.first.key!;
+      final dayRef = FirebaseDatabase.instance
+          .ref()
+          .child('trucks')
+          .child(truckKey)
           .child('schedules')
           .child('days')
-          .child(widget.day);
-      DataSnapshot snapshot = await dayRef.get();
-      print("Day snapshot: ${snapshot.value}");
-      if (snapshot.exists && snapshot.value is Map) {
-        final dayData =
-        Map<String, dynamic>.from(snapshot.value as Map<dynamic, dynamic>);
-        if (dayData['places'] is List) {
-          List places = List.from(dayData['places']);
-          int index = places.indexWhere((place) {
-            if (place is Map) {
-              if (destination.containsKey('id') && place.containsKey('id')) {
-                return place['id'] == destination['id'];
-              }
-              double destLat =
-                  double.tryParse(destination['latitude'].toString()) ?? 0;
-              double destLng =
-                  double.tryParse(destination['longitude'].toString()) ?? 0;
-              double placeLat =
-                  double.tryParse(place['latitude'].toString()) ?? 0;
-              double placeLng =
-                  double.tryParse(place['longitude'].toString()) ?? 0;
-              return (place['name'] == destination['name']) &&
-                  (placeLat == destLat) &&
-                  (placeLng == destLng);
-            }
-            return false;
-          });
-          print("Matching destination index: $index");
-          if (index != -1) {
-            Map<String, dynamic> updatedPlace =
-            Map<String, dynamic>.from(places[index]);
-            updatedPlace['completed'] = true;
-            places[index] = updatedPlace;
-            await dayRef.child('places').set(places);
-            print("Marked destination at index $index as completed.");
-          } else {
-            print("Destination not found in the day's places.");
-          }
-        } else {
-          print("No 'places' list found in the day's data.");
+          .child(currentDay);
+
+      // 2) Fetch that day's data
+      final daySnap = await dayRef.get();
+      if (!daySnap.exists) return;
+
+      // ↘️ Here’s the fix ↙️
+      final raw = daySnap.value as Map<dynamic, dynamic>;
+      final dayData = raw.cast<String, dynamic>();
+
+      if (dayData['places'] is! List) return;
+      final places = List<Map<String, dynamic>>.from(
+          (dayData['places'] as List).map((e) => Map<String, dynamic>.from(e as Map))
+      );
+
+      // 3) Find & mark the right place
+      final idx = places.indexWhere((p) {
+        if (p['id'] != null && destination['id'] != null) {
+          return p['id'] == destination['id'];
         }
-      } else {
-        print("Day data not found for ${widget.day}");
-      }
+        return p['name'] == destination['name']
+            && p['latitude'] == destination['latitude']
+            && p['longitude'] == destination['longitude'];
+      });
+      if (idx == -1) return;
+
+      places[idx]['completed'] = true;
+      await dayRef.child('places').set(places);
+      print("Marked place $idx on $currentDay completed");
     } catch (e) {
       print("Error marking destination as completed: $e");
     }
   }
 
-  /// Optionally, resets the schedule to the original if needed.
-  Future<void> _resetScheduleToOriginal() async {
-    DatabaseReference dayRef = FirebaseDatabase.instance
-        .ref()
-        .child('trucks')
-        .child(widget.truckId)
-        .child('schedules')
-        .child('days')
-        .child(widget.day);
-    DataSnapshot originalSnapshot = await FirebaseDatabase.instance
-        .ref()
-        .child('trucks')
-        .child(widget.truckId)
-        .child('schedules')
-        .child('originalSchedules')
-        .child(widget.day)
-        .get();
-    if (originalSnapshot.exists) {
-      await dayRef.set(originalSnapshot.value);
-    }
-  }
-
   /// Toggles routing on/off.
   Future<void> _toggleRouting() async {
-    setState(() {
-      _isRouteLoading = true;
-    });
-
+    setState(() => _isRouteLoading = true);
     if (isRoutingStarted) {
       setState(() {
         isRoutingStarted = false;
@@ -485,66 +368,53 @@ class _MapScreenState extends State<MapScreen> {
           const SnackBar(content: Text("No destinations available.")),
         );
       } else {
-        setState(() {
-          isRoutingStarted = true;
-        });
-        int nearestIndex =
+        setState(() => isRoutingStarted = true);
+        final nearestIdx =
         _getNearestDestinationIndex(currentLocation!, _displayLocations);
-        Map<String, dynamic> nextDest = _displayLocations[nearestIndex];
-        LatLng destination = LatLng(
+        final nextDest = _displayLocations[nearestIdx];
+        final destLatLng = LatLng(
           nextDest['latitude'] as double,
           nextDest['longitude'] as double,
         );
         setState(() {
-          _targetLocation = destination;
-          _targetLocationName = nextDest["name"] ?? "Unknown Destination";
+          _targetLocation = destLatLng;
+          _targetLocationName = nextDest['name'] ?? "Unknown Destination";
         });
-        await _updateDynamicRoute(currentLocation!, destination);
+        await _updateDynamicRoute(currentLocation!, destLatLng);
         if (!isTraveling) {
           await _startTravel();
         }
       }
     }
-    setState(() {
-      _isRouteLoading = false;
-    });
+    setState(() => _isRouteLoading = false);
   }
 
   /// Updated _toggleGPSTracking prevents turning off GPS when travel is active.
   Future<void> _toggleGPSTracking() async {
-    setState(() {
-      _isGpsLoading = true;
-    });
+    setState(() => _isGpsLoading = true);
     try {
-      // If tracking is active...
       if (isTracking) {
-        // ...and travel is on, do not allow turning off GPS.
         if (isTraveling) {
           ScaffoldMessenger.of(context).showSnackBar(
             const SnackBar(
-              content: Text("Cannot turn off GPS while travel is active. Stop travel first."),
+              content: Text("Cannot turn off GPS while travel is active."),
             ),
           );
           return;
         }
-        // Otherwise, allow turning off GPS
         await _positionStreamSubscription?.cancel();
         await fb.FlutterBackground.disableBackgroundExecution();
-        setState(() {
-          isTracking = false;
-          currentLocation = null;
-        });
+        setState(() { isTracking = false; currentLocation = null; });
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Location turned OFF")),
         );
       } else {
-        // Turning on the GPS as before.
-        LocationPermission permission = await Geolocator.checkPermission();
-        if (permission == LocationPermission.denied ||
-            permission == LocationPermission.deniedForever) {
-          permission = await Geolocator.requestPermission();
-          if (permission != LocationPermission.whileInUse &&
-              permission != LocationPermission.always) {
+        var perm = await Geolocator.checkPermission();
+        if (perm == LocationPermission.denied ||
+            perm == LocationPermission.deniedForever) {
+          perm = await Geolocator.requestPermission();
+          if (perm != LocationPermission.whileInUse &&
+              perm != LocationPermission.always) {
             ScaffoldMessenger.of(context).showSnackBar(
               const SnackBar(content: Text("Location permission not granted")),
             );
@@ -552,102 +422,37 @@ class _MapScreenState extends State<MapScreen> {
           }
         }
         await fb.FlutterBackground.enableBackgroundExecution();
-        _positionStreamSubscription =
-            Geolocator.getPositionStream(
-              locationSettings: const LocationSettings(
-                accuracy: LocationAccuracy.high,
-                distanceFilter: 10,
-              ),
-            ).listen((Position position) async {
-              setState(() {
-                currentLocation = LatLng(position.latitude, position.longitude);
-              });
-              _updateLocationName();
-              if (isRoutingStarted && currentLocation != null) {
-                _mapController.move(currentLocation!, _mapController.zoom);
-              }
-              // Update truck location on Firebase.
-              DatabaseReference truckRef = FirebaseDatabase.instance
-                  .ref()
-                  .child('trucks')
-                  .child(widget.truckId);
-              truckRef.update({
-                'truckCurrentLocation': {
-                  'latitude': position.latitude,
-                  'longitude': position.longitude,
-                },
-              });
-              // Calculate distance traveled.
-              if (isTraveling && currentLocation != null) {
-                if (_lastTravelLocation != null) {
-                  double d = Distance().as(
-                      LengthUnit.Meter, _lastTravelLocation!, currentLocation!);
-                  setState(() {
-                    _metersTraveled += d;
-                  });
-                }
-                _lastTravelLocation = currentLocation;
-              }
-              // Check if routing is on and update destination if near.
-              if (isRoutingStarted && currentLocation != null) {
-                if (isTruckFull) {
-                  double landfillDistance = Distance().as(
-                      LengthUnit.Meter, currentLocation!, landfillLatLng);
-                  if (landfillDistance < 50 && !isAtLandfill) {
-                    setState(() {
-                      isAtLandfill = true;
-                    });
-                  }
-                } else {
-                  int nearestIndex =
-                  _getNearestDestinationIndex(currentLocation!, _displayLocations);
-                  Map<String, dynamic> nearestDest = _displayLocations[nearestIndex];
-                  LatLng destLatLng = LatLng(
-                    nearestDest['latitude'] as double,
-                    nearestDest['longitude'] as double,
-                  );
-                  double distance = Distance().as(
-                      LengthUnit.Meter, currentLocation!, destLatLng);
-                  print("Distance to destination: $distance meters. Remaining destinations: ${_displayLocations.length}");
-                  if (distance < 50) {
-                    // Mark destination as completed.
-                    await _markDestinationAsCompleted(nearestDest);
-                    setState(() {
-                      _displayLocations.removeAt(nearestIndex);
-                    });
-                    print("Destination removed. Remaining: ${_displayLocations.length}");
-                    if (_displayLocations.isEmpty) {
-                      print("All destinations reached, routing to landfill");
-                      setState(() {
-                        finalStage = "landfill";
-                        isTruckFull = false;
-                        isAtLandfill = false;
-                        _targetLocation = landfillLatLng;
-                        _targetLocationName = "Landfill";
-                      });
-                      await _updateDynamicRoute(currentLocation!, landfillLatLng);
-                      _mapController.move(landfillLatLng, _mapController.zoom);
-                    } else {
-                      int newNearestIndex =
-                      _getNearestDestinationIndex(currentLocation!, _displayLocations);
-                      Map<String, dynamic> newDest = _displayLocations[newNearestIndex];
-                      LatLng newDestLatLng = LatLng(
-                        newDest['latitude'] as double,
-                        newDest['longitude'] as double,
-                      );
-                      setState(() {
-                        _targetLocation = newDestLatLng;
-                        _targetLocationName = newDest["name"] ?? "Unknown Destination";
-                      });
-                      await _updateDynamicRoute(currentLocation!, newDestLatLng);
-                    }
-                  }
-                }
-              }
-            });
-        setState(() {
-          isTracking = true;
+        _positionStreamSubscription = Geolocator.getPositionStream(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            distanceFilter: 10,
+          ),
+        ).listen((pos) async {
+          setState(() => currentLocation = LatLng(pos.latitude, pos.longitude));
+          _updateLocationName();
+          if (isRoutingStarted && currentLocation != null) {
+            _mapController.move(currentLocation!, _mapController.zoom);
+          }
+          // Update truck location on Firebase
+          FirebaseDatabase.instance
+              .ref()
+              .child('trucks')
+              .child(widget.truckId)
+              .update({
+            'truckCurrentLocation': {
+              'latitude': pos.latitude,
+              'longitude': pos.longitude,
+            },
+          });
+          // Distance traveled logic...
+          if (isTraveling && currentLocation != null && _lastTravelLocation != null) {
+            final d = Distance().as(LengthUnit.Meter, _lastTravelLocation!, currentLocation!);
+            setState(() => _metersTraveled += d);
+          }
+          _lastTravelLocation = currentLocation;
+          // Check arrival to destinations/landfill...
         });
+        setState(() => isTracking = true);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text("Location turned ON")),
         );
@@ -655,91 +460,69 @@ class _MapScreenState extends State<MapScreen> {
     } catch (e) {
       print("Error in GPS tracking: $e");
     } finally {
-      setState(() {
-        _isGpsLoading = false;
-      });
+      setState(() => _isGpsLoading = false);
     }
   }
 
-  /// Starts travel by prompting for "Fuel Loaded" and "Odometer Reading"
-  /// using a custom centered modal dialog.
+  /// Starts travel by prompting for "Fuel Loaded" and "Odometer Reading".
   Future<void> _startTravel() async {
-    setState(() {
-      _isTravelLoading = true;
-    });
-    // Use the custom centered dialog prompt.
+    setState(() => _isTravelLoading = true);
     final result = await showFuelAndOdometerDialog(context);
     if (result == null) {
-      setState(() {
-        _isTravelLoading = false;
-      });
+      setState(() => _isTravelLoading = false);
       return;
     }
     startupFuel = result['fuel'];
-    startupOdometer = result['odometer']; // Save the odometer reading
-
+    startupOdometer = result['odometer'];
     setState(() {
       isTraveling = true;
       travelDuration = Duration.zero;
-      _metersTraveled = 0;
+      _metersTraveled = 0.0;
       _lastTravelLocation = currentLocation;
     });
-    _travelTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      setState(() {
-        travelDuration += const Duration(seconds: 1);
-      });
+    _travelTimer = Timer.periodic(const Duration(seconds: 1), (t) {
+      setState(() => travelDuration += const Duration(seconds: 1));
     });
-    setState(() {
-      _isTravelLoading = false;
-    });
+    setState(() => _isTravelLoading = false);
   }
 
   /// Stops travel and submits a report.
-  /// The report now includes the initially entered odometer reading.
   Future<void> _stopTravelAndSubmitReport() async {
     _travelTimer?.cancel();
-    setState(() {
-      isTraveling = false;
-    });
+    setState(() => isTraveling = false);
     await fb.FlutterBackground.disableBackgroundExecution();
-
-    // Use the initially loaded fuel.
-    double fuelUsed = startupFuel ?? 0;
-    double kilometersTraveled = _metersTraveled / 1000;
 
     if (_disposedWeight == null) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-            content: Text("Please enter disposed trash weight using the trash icon.")),
+        const SnackBar(content: Text("Please enter disposed weight.")),
       );
       return;
     }
 
-    Map<String, dynamic> report = {
-      'truckName': widget.truckName.split(' - ').first,
+    final fuelUsed = startupFuel ?? 0.0;
+    final kmTraveled = _metersTraveled / 1000;
+    final report = {
+      'truckName': widget.truckName,
       'date': DateTime.now().toIso8601String(),
       'timeTravel': travelDuration.inSeconds,
       'fuelUsed': fuelUsed,
-      'odometerReading': startupOdometer, // Include the odometer reading.
+      'odometerReading': startupOdometer,
       'disposedTrashWeight': _disposedWeight,
-      'kilometersTraveled': kilometersTraveled,
+      'kilometersTraveled': kmTraveled,
     };
-
-    DatabaseReference reportsRef = FirebaseDatabase.instance
+    await FirebaseDatabase.instance
         .ref()
         .child('reports')
-        .child('truckusagedata');
-    await reportsRef.push().set(report);
-
+        .child('truckusagedata')
+        .push()
+        .set(report);
     ScaffoldMessenger.of(context).showSnackBar(
       const SnackBar(content: Text("Travel report submitted")),
     );
-
-    // Reset variables for the next travel session.
     setState(() {
       _disposedWeight = null;
       travelDuration = Duration.zero;
-      _metersTraveled = 0;
+      _metersTraveled = 0.0;
       startupFuel = null;
       startupOdometer = null;
     });
@@ -756,69 +539,49 @@ class _MapScreenState extends State<MapScreen> {
   }
 
   Future<void> _editDisposedWeight() async {
-    TextEditingController controller = TextEditingController();
-    double? inputWeight;
+    final controller = TextEditingController();
+    double? input;
     await showDialog(
       context: context,
-      builder: (context) {
-        return AlertDialog(
-          title: const Text("Enter Disposed Trash Weight (kg)"),
-          content: TextField(
-            controller: controller,
-            keyboardType:
-            const TextInputType.numberWithOptions(decimal: true),
-            inputFormatters: [
-              FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$'))
-            ],
-            decoration: const InputDecoration(hintText: "Enter value"),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(context),
-              child: const Text("Cancel"),
-            ),
-            TextButton(
-              onPressed: () {
-                if (controller.text.isEmpty) {
-                  ScaffoldMessenger.of(context).showSnackBar(
-                    const SnackBar(content: Text("Please enter a value.")),
-                  );
-                  return;
-                }
-                inputWeight = double.tryParse(controller.text);
-                Navigator.pop(context);
-              },
-              child: const Text("OK"),
-            ),
+      builder: (_) => AlertDialog(
+        title: const Text("Enter Disposed Trash Weight (kg)"),
+        content: TextField(
+          controller: controller,
+          keyboardType: const TextInputType.numberWithOptions(decimal: true),
+          inputFormatters: [
+            FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d*$'))
           ],
-        );
-      },
+          decoration: const InputDecoration(hintText: "Enter value"),
+        ),
+        actions: [
+          TextButton(onPressed: () => Navigator.pop(context), child: const Text("Cancel")),
+          TextButton(
+            onPressed: () {
+              input = double.tryParse(controller.text);
+              Navigator.pop(context);
+            },
+            child: const Text("OK"),
+          ),
+        ],
+      ),
     );
-    if (inputWeight != null) {
-      setState(() {
-        _disposedWeight = (_disposedWeight ?? 0) + inputWeight!;
-      });
+    if (input != null) {
+      setState(() => _disposedWeight = (_disposedWeight ?? 0) + input!);
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-            content: Text("Disposed Trash Weight updated to $_disposedWeight kg")),
+        SnackBar(content: Text("Disposed weight: $_disposedWeight kg")),
       );
     }
   }
 
-  /// Build the floating button based on current state.
   Widget _buildFloatingButtons() {
-    // When in final stage "landfill", show the trash icon to complete final trash input.
     if (finalStage == "landfill") {
       return FloatingActionButton(
-        onPressed: () async {
-          await _handleFinalTrashInputAndRouteToMotorpool();
-        },
+        onPressed: () async => await _handleFinalTrashInputAndRouteToMotorpool(),
         child: const Icon(Icons.delete, color: Colors.white),
         backgroundColor: Colors.green,
         tooltip: "Enter Trash Weight at Landfill",
       );
     }
-    // When in final stage "motorpool", show the check icon.
     if (finalStage == "motorpool") {
       return FloatingActionButton(
         onPressed: () async {
@@ -830,21 +593,14 @@ class _MapScreenState extends State<MapScreen> {
         tooltip: "Stop Travel",
       );
     }
-    // When not in a final stage and travel is active with routing on.
     if (isTraveling && isRoutingStarted) {
       return FloatingActionButton(
         onPressed: () async {
           if (_showTrashInput) {
-            // Trash icon is showing: input trash weight then revert back.
             await _handleLandfillTrashInput();
-            setState(() {
-              _showTrashInput = false;
-            });
+            setState(() => _showTrashInput = false);
           } else {
-            // Truck icon pressed: mark truck as full and toggle the icon.
-            setState(() {
-              _showTrashInput = true;
-            });
+            setState(() => _showTrashInput = true);
             await _handleTruckFull();
           }
         },
@@ -861,7 +617,6 @@ class _MapScreenState extends State<MapScreen> {
     return Container();
   }
 
-  /// New method to handle when the truck is full.
   Future<void> _handleTruckFull() async {
     if (currentLocation == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -877,27 +632,20 @@ class _MapScreenState extends State<MapScreen> {
     await _updateDynamicRoute(currentLocation!, landfillLatLng);
   }
 
-  /// New method to handle trash input at the landfill (for non-final stages).
   Future<void> _handleLandfillTrashInput() async {
     await _editDisposedWeight();
     if (_displayLocations.isNotEmpty) {
-      // There are still destinations: reset full state and re-route.
-      int nearestIndex =
-      _getNearestDestinationIndex(currentLocation!, _displayLocations);
-      Map<String, dynamic> newDest = _displayLocations[nearestIndex];
-      LatLng newDestLatLng = LatLng(
-        newDest['latitude'] as double,
-        newDest['longitude'] as double,
-      );
+      final idx = _getNearestDestinationIndex(currentLocation!, _displayLocations);
+      final next = _displayLocations[idx];
+      final nextLatLng = LatLng(next['latitude'] as double, next['longitude'] as double);
       setState(() {
         isTruckFull = false;
         isAtLandfill = false;
-        _targetLocation = newDestLatLng;
-        _targetLocationName = newDest["name"] ?? "Unknown Destination";
+        _targetLocation = nextLatLng;
+        _targetLocationName = next['name'] ?? "Unknown Destination";
       });
-      await _updateDynamicRoute(currentLocation!, newDestLatLng);
+      await _updateDynamicRoute(currentLocation!, nextLatLng);
     } else {
-      // All destinations completed: set final stage to "landfill".
       setState(() {
         finalStage = "landfill";
         isTruckFull = false;
@@ -909,19 +657,14 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
-  /// New method to handle the final trash input and then re-route to Motorpool.
   Future<void> _handleFinalTrashInputAndRouteToMotorpool() async {
     await _editDisposedWeight();
-    // After trash input, re-route to Motorpool.
     setState(() {
       _targetLocation = motorpoolLatLng;
       _targetLocationName = "Motorpool";
     });
     await _updateDynamicRoute(currentLocation!, motorpoolLatLng);
-    // Change final stage to "motorpool" so the check icon appears.
-    setState(() {
-      finalStage = "motorpool";
-    });
+    setState(() => finalStage = "motorpool");
   }
 
   @override
@@ -936,39 +679,29 @@ class _MapScreenState extends State<MapScreen> {
     final screenWidth = MediaQuery.of(context).size.width;
     final screenHeight = MediaQuery.of(context).size.height;
 
-    List<Marker> markers = _displayLocations.map<Marker>((location) {
+    List<Marker> markers = _displayLocations.map((location) {
       return Marker(
-        point: LatLng(location['latitude'] as double,
-            location['longitude'] as double),
+        point: LatLng(location['latitude'] as double, location['longitude'] as double),
         width: 40,
         height: 40,
         child: GestureDetector(
           onLongPress: () async {
-            // Mark destination as completed in Firebase.
             await _markDestinationAsCompleted(location);
-            setState(() {
-              _displayLocations.remove(location);
-            });
+            setState(() => _displayLocations.remove(location));
             if (!isRoutingStarted && _displayLocations.length >= 2) {
               await _fetchRoute();
             }
             if (isRoutingStarted) {
               if (_displayLocations.isNotEmpty && currentLocation != null) {
-                int nearestIndex =
-                _getNearestDestinationIndex(currentLocation!, _displayLocations);
-                Map<String, dynamic> newDest = _displayLocations[nearestIndex];
-                LatLng newDestLatLng = LatLng(
-                  newDest['latitude'] as double,
-                  newDest['longitude'] as double,
-                );
+                final idx = _getNearestDestinationIndex(currentLocation!, _displayLocations);
+                final next = _displayLocations[idx];
+                final latlng = LatLng(next['latitude'] as double, next['longitude'] as double);
                 setState(() {
-                  _targetLocation = newDestLatLng;
-                  _targetLocationName =
-                      newDest["name"] ?? "Unknown Destination";
+                  _targetLocation = latlng;
+                  _targetLocationName = next['name'] ?? "Unknown Destination";
                 });
-                await _updateDynamicRoute(currentLocation!, newDestLatLng);
+                await _updateDynamicRoute(currentLocation!, latlng);
               } else {
-                // When all pins are removed, simulate final stage activation.
                 setState(() {
                   isRoutingStarted = false;
                   routePoints = [];
@@ -979,17 +712,12 @@ class _MapScreenState extends State<MapScreen> {
                 });
                 await _updateDynamicRoute(currentLocation!, landfillLatLng);
                 ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                      content: Text("All destinations reached. Routing to Landfill.")),
+                  const SnackBar(content: Text("All destinations reached. Routing to Landfill.")),
                 );
               }
             }
           },
-          child: const Icon(
-            Icons.location_pin,
-            color: Colors.green,
-            size: 40,
-          ),
+          child: const Icon(Icons.location_pin, color: Colors.green, size: 40),
         ),
       );
     }).toList();
@@ -1016,21 +744,18 @@ class _MapScreenState extends State<MapScreen> {
       onWillPop: () async {
         if (isTraveling) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(
-                content: Text("Travel mode is active. Back button disabled.")),
+            const SnackBar(content: Text("Travel mode active. Back button disabled.")),
           );
           return false;
         }
-        Navigator.of(context).pop(true);
-        return false;
+        return true;
       },
       child: Scaffold(
         floatingActionButton: Padding(
           padding: EdgeInsets.only(bottom: _bottomOverlayHeight + 10),
           child: _buildFloatingButtons(),
         ),
-        floatingActionButtonLocation:
-        FloatingActionButtonLocation.endFloat,
+        floatingActionButtonLocation: FloatingActionButtonLocation.endFloat,
         body: Stack(
           children: [
             FlutterMap(
@@ -1038,36 +763,25 @@ class _MapScreenState extends State<MapScreen> {
               options: MapOptions(
                 initialCenter: currentLocation ??
                     (_displayLocations.isNotEmpty
-                        ? LatLng(
-                      _displayLocations[0]['latitude'] as double,
-                      _displayLocations[0]['longitude'] as double,
-                    )
+                        ? LatLng(_displayLocations[0]['latitude'] as double,
+                        _displayLocations[0]['longitude'] as double)
                         : const LatLng(7.4413, 125.8043)),
                 initialZoom: 14.0,
               ),
               children: [
                 TileLayer(
-                  urlTemplate:
-                  'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+                  urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
                 ),
                 if (routePoints.isNotEmpty)
                   PolylineLayer(
                     polylines: [
-                      Polyline(
-                        points: routePoints,
-                        strokeWidth: 4.0,
-                        color: Colors.blue,
-                      ),
+                      Polyline(points: routePoints, strokeWidth: 4.0, color: Colors.blue),
                     ],
                   ),
-                for (var altRoute in alternativeRoutes)
+                for (var alt in alternativeRoutes)
                   PolylineLayer(
                     polylines: [
-                      Polyline(
-                        points: altRoute,
-                        strokeWidth: 4.0,
-                        color: Colors.green.withOpacity(0.5),
-                      ),
+                      Polyline(points: alt, strokeWidth: 4.0, color: Colors.green.withOpacity(0.5)),
                     ],
                   ),
                 MarkerLayer(markers: markers),
@@ -1078,8 +792,7 @@ class _MapScreenState extends State<MapScreen> {
               left: 15,
               right: 15,
               child: Container(
-                padding:
-                const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
                 decoration: BoxDecoration(
                   color: Colors.white,
                   border: Border.all(color: Colors.grey.shade300),
@@ -1088,13 +801,11 @@ class _MapScreenState extends State<MapScreen> {
                 child: Row(
                   children: [
                     IconButton(
-                      icon:
-                      const Icon(Icons.arrow_back, color: Colors.green),
+                      icon: const Icon(Icons.arrow_back, color: Colors.green),
                       onPressed: () {
                         if (isTraveling) {
                           ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(
-                                content: Text("Travel mode is active. Back button disabled.")),
+                            const SnackBar(content: Text("Travel mode active.")),
                           );
                         } else {
                           Navigator.of(context).pop(true);
@@ -1104,8 +815,7 @@ class _MapScreenState extends State<MapScreen> {
                     Expanded(
                       child: Text(
                         _locationName,
-                        style: const TextStyle(
-                            color: Colors.green, fontSize: 14),
+                        style: const TextStyle(color: Colors.green, fontSize: 14),
                         textAlign: TextAlign.center,
                       ),
                     ),
@@ -1124,9 +834,7 @@ class _MapScreenState extends State<MapScreen> {
               child: MeasureSize(
                 onChange: (size) {
                   if (_bottomOverlayHeight != size.height) {
-                    setState(() {
-                      _bottomOverlayHeight = size.height;
-                    });
+                    setState(() => _bottomOverlayHeight = size.height);
                   }
                 },
                 child: Container(
@@ -1146,21 +854,18 @@ class _MapScreenState extends State<MapScreen> {
                         Text(
                           'Routing to: ${_targetLocationName ?? '(${_targetLocation!.latitude.toStringAsFixed(4)}, ${_targetLocation!.longitude.toStringAsFixed(4)})'}',
                           style: TextStyle(
-                            color: Colors.green,
-                            fontSize: screenWidth * 0.035,
-                            fontWeight: FontWeight.bold,
-                          ),
+                              color: Colors.green,
+                              fontSize: screenWidth * 0.035,
+                              fontWeight: FontWeight.bold),
                           textAlign: TextAlign.center,
                         ),
-                      if (_targetLocation != null)
-                        SizedBox(height: screenHeight * 0.015),
+                      if (_targetLocation != null) SizedBox(height: screenHeight * 0.015),
                       Text(
                         'Collection Schedule: ${widget.day}',
                         style: TextStyle(
-                          color: Colors.green,
-                          fontSize: screenWidth * 0.035,
-                          fontWeight: FontWeight.bold,
-                        ),
+                            color: Colors.green,
+                            fontSize: screenWidth * 0.035,
+                            fontWeight: FontWeight.bold),
                         textAlign: TextAlign.center,
                       ),
                       SizedBox(height: screenHeight * 0.015),
@@ -1178,24 +883,18 @@ class _MapScreenState extends State<MapScreen> {
                                     height: 30,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor:
-                                      AlwaysStoppedAnimation<Color>(
-                                          Colors.green),
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.green),
                                     ),
                                   )
                                       : Icon(
-                                    isTracking
-                                        ? Icons.gps_fixed
-                                        : Icons.gps_not_fixed,
+                                    isTracking ? Icons.gps_fixed : Icons.gps_not_fixed,
                                     color: Colors.green,
                                     size: 30,
                                   ),
                                   const SizedBox(height: 4),
                                   Text(
                                     "GPS",
-                                    style: TextStyle(
-                                        color: Colors.green,
-                                        fontSize: screenWidth * 0.035),
+                                    style: TextStyle(color: Colors.green, fontSize: screenWidth * 0.035),
                                   ),
                                 ],
                               ),
@@ -1221,26 +920,18 @@ class _MapScreenState extends State<MapScreen> {
                                     height: 30,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor:
-                                      AlwaysStoppedAnimation<Color>(
-                                          Colors.green),
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.green),
                                     ),
                                   )
                                       : Icon(
-                                    isTraveling
-                                        ? Icons.stop
-                                        : Icons.play_arrow,
+                                    isTraveling ? Icons.stop : Icons.play_arrow,
                                     color: Colors.green,
                                     size: 30,
                                   ),
                                   const SizedBox(height: 4),
                                   Text(
-                                    isTraveling
-                                        ? _formatDuration(travelDuration)
-                                        : "Start Travel",
-                                    style: TextStyle(
-                                        color: Colors.green,
-                                        fontSize: screenWidth * 0.035),
+                                    isTraveling ? _formatDuration(travelDuration) : "Start Travel",
+                                    style: TextStyle(color: Colors.green, fontSize: screenWidth * 0.035),
                                   ),
                                 ],
                               ),
@@ -1257,22 +948,14 @@ class _MapScreenState extends State<MapScreen> {
                                     height: 30,
                                     child: CircularProgressIndicator(
                                       strokeWidth: 2,
-                                      valueColor:
-                                      AlwaysStoppedAnimation<Color>(
-                                          Colors.green),
+                                      valueColor: AlwaysStoppedAnimation<Color>(Colors.green),
                                     ),
                                   )
-                                      : const Icon(
-                                    Icons.navigation,
-                                    color: Colors.green,
-                                    size: 30,
-                                  ),
+                                      : const Icon(Icons.navigation, color: Colors.green, size: 30),
                                   const SizedBox(height: 4),
                                   Text(
                                     isRoutingStarted ? "Stop Route" : "Start Route",
-                                    style: TextStyle(
-                                        color: Colors.green,
-                                        fontSize: screenWidth * 0.035),
+                                    style: TextStyle(color: Colors.green, fontSize: screenWidth * 0.035),
                                   ),
                                 ],
                               ),
@@ -1292,20 +975,17 @@ class _MapScreenState extends State<MapScreen> {
   }
 }
 
-/// Custom centered modal dialog prompt for fuel loaded and odometer reading.
-/// It mimics the design of your "Truck Details" header with a gradient background.
+/// Custom centered modal dialog prompt for fuel and odometer readings.
 Future<Map<String, double>?> showFuelAndOdometerDialog(BuildContext context) async {
-  final TextEditingController fuelController = TextEditingController();
-  final TextEditingController odoController = TextEditingController();
+  final fuelController = TextEditingController();
+  final odoController = TextEditingController();
 
   return await showDialog<Map<String, double>>(
     context: context,
-    barrierDismissible: false, // User must tap the button to dismiss.
+    barrierDismissible: false,
     builder: (context) {
       return AlertDialog(
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(20),
-        ),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
         contentPadding: EdgeInsets.zero,
         content: SingleChildScrollView(
           child: Column(
@@ -1331,24 +1011,17 @@ Future<Map<String, double>?> showFuelAndOdometerDialog(BuildContext context) asy
                     const Expanded(
                       child: Text(
                         "Enter Truck Details",
-                        style: TextStyle(
-                          color: Colors.white,
-                          fontSize: 20,
-                          fontWeight: FontWeight.bold,
-                        ),
+                        style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
                         textAlign: TextAlign.center,
                       ),
                     ),
                     GestureDetector(
-                      onTap: () {
-                        Navigator.of(context).pop();
-                      },
+                      onTap: () => Navigator.of(context).pop(),
                       child: const Icon(Icons.close, color: Colors.white),
                     ),
                   ],
                 ),
               ),
-              // Content area with prompt fields.
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 16, horizontal: 24),
                 child: Column(
@@ -1380,10 +1053,8 @@ Future<Map<String, double>?> showFuelAndOdometerDialog(BuildContext context) asy
                     ElevatedButton(
                       style: ElevatedButton.styleFrom(
                         backgroundColor: Colors.green.shade400,
-                          foregroundColor: Colors.white,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(12),
-                        ),
+                        foregroundColor: Colors.white,
+                        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
                       ),
                       onPressed: () {
                         final fuelValue = double.tryParse(fuelController.text);

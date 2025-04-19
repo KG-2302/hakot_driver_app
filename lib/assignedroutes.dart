@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:firebase_database/firebase_database.dart';
 import 'profile_screen.dart';
@@ -9,7 +10,7 @@ class AssignedRoutes extends StatefulWidget {
   final String driverUsername;
   final String driverFullName;
   final String assignedTruck;
-  final String truckId; // The truck's Firebase key.
+  final String truckId;
   final String driverId;
 
   const AssignedRoutes({
@@ -27,180 +28,137 @@ class AssignedRoutes extends StatefulWidget {
   _AssignedRoutesState createState() => _AssignedRoutesState();
 }
 
-class _AssignedRoutesState extends State<AssignedRoutes> {
+class _AssignedRoutesState extends State<AssignedRoutes> with WidgetsBindingObserver {
   late Map<String, List<Map<String, dynamic>>> _schedules;
-  late Map<String, List<Map<String, dynamic>>> _originalSchedules;
   late String _driverProfileImgUrl;
+
   final List<String> _daysOrder = const [
-    "Monday",
-    "Tuesday",
-    "Wednesday",
-    "Thursday",
-    "Friday",
-    "Saturday",
-    "Sunday"
+    "Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"
   ];
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _schedules = widget.schedules;
-    // Save a copy of the original schedules (for resetting at end of day)
-    _originalSchedules = Map.from(widget.schedules);
     _driverProfileImgUrl = widget.driverProfileImgUrl;
     _refreshData();
-    _setupEndOfDayRefresh();
   }
 
-  /// Sets up a timer to reset the schedule at midnight.
-  void _setupEndOfDayRefresh() {
-    final now = DateTime.now();
-    final tomorrow = DateTime(now.year, now.month, now.day + 1);
-    final durationUntilMidnight = tomorrow.difference(now);
-    Future.delayed(durationUntilMidnight, () {
-      // Reset the schedule to the original values, then re-fetch updated data.
-      setState(() {
-        _schedules = Map.from(_originalSchedules);
-      });
-      _refreshData();
-      // Set up for the next day.
-      _setupEndOfDayRefresh();
-    });
+  @override
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    super.dispose();
   }
 
-  /// Fetches updated truck schedules from Firebase and updates the driver image URL.
   Future<void> _refreshData() async {
     final newSchedules = await _fetchTruckSchedules();
-    final updatedProfileImgUrl = await _fetchDriverProfileImgUrl();
-    // Optional delay for smoother UI transition.
-    await Future.delayed(const Duration(seconds: 1));
+    final newImg = await _fetchDriverProfileImgUrl();
     if (!mounted) return;
     setState(() {
       _schedules = newSchedules;
-      _driverProfileImgUrl = updatedProfileImgUrl;
+      _driverProfileImgUrl = newImg;
     });
   }
 
-  /// Queries Firebase for the truck's schedules and filters out completed routes.
   Future<Map<String, List<Map<String, dynamic>>>> _fetchTruckSchedules() async {
     final Map<String, List<Map<String, dynamic>>> schedules = {};
-
-    // Query trucks by vehicleDriver using the driver's full name.
-    final query = FirebaseDatabase.instance
-        .ref()
-        .child('trucks')
+    final snap = await FirebaseDatabase.instance
+        .ref('trucks')
         .orderByChild('vehicleDriver')
-        .equalTo(widget.driverFullName);
-    final snapshot = await query.get();
+        .equalTo(widget.driverFullName)
+        .get();
 
-    print("Fetched truck schedules snapshot: ${snapshot.value}");
-    if (snapshot.exists) {
-      for (final truck in snapshot.children) {
-        if (truck.value is Map) {
-          final truckData = Map<String, dynamic>.from(truck.value as Map);
-          final schedulesData = truckData['schedules']?['days'];
-          if (schedulesData is Map) {
-            schedulesData.forEach((day, details) {
-              if (details is Map && details['places'] is List) {
-                // Filter out routes where "completed" is true.
-                final places = (details['places'] as List)
-                    .where((place) =>
-                place is Map &&
-                    (place["completed"] == null || place["completed"] != true))
-                    .map<Map<String, dynamic>>(
-                        (place) => Map<String, dynamic>.from(place))
-                    .toList();
-                schedules[day.toString()] = places;
-              }
-            });
-          }
-          break; // Only need the first matching truck.
+    if (snap.exists) {
+      for (final truck in snap.children) {
+        final data = truck.value as Map<dynamic, dynamic>;
+        final days = data['schedules']?['days'];
+        if (days is Map) {
+          days.forEach((day, details) {
+            if (details is Map && details['places'] is List) {
+              final places = (details['places'] as List)
+                  .where((p) => p is Map && p['completed'] != true)
+                  .map((p) => Map<String, dynamic>.from(p as Map))
+                  .toList();
+              schedules[day] = places;
+            }
+          });
         }
+        break; // just the first matching truck
       }
     }
-    print("Schedules after filtering completed: $schedules");
     return schedules;
   }
 
-  /// Fetches the driver's profile image URL from Firebase.
   Future<String> _fetchDriverProfileImgUrl() async {
-    String imageUrl = widget.driverProfileImgUrl;
-    final driverSnapshot = await FirebaseDatabase.instance
-        .ref()
-        .child('drivers')
+    String url = widget.driverProfileImgUrl;
+    final snap = await FirebaseDatabase.instance
+        .ref('drivers')
         .child(widget.driverId)
         .get();
-    if (driverSnapshot.exists && driverSnapshot.value is Map) {
-      final driverData =
-      Map<String, dynamic>.from(driverSnapshot.value as Map);
-      imageUrl = driverData['imageUrl']?.toString().trim() ?? imageUrl;
+    if (snap.exists && snap.value is Map) {
+      final data = Map<String, dynamic>.from(snap.value as Map);
+      url = data['imageUrl']?.toString().trim() ?? url;
     }
-    return imageUrl;
+    return url;
   }
 
-  /// Builds the UI for a specific day, listing its remaining routes.
-  Widget _buildDaySection(String day, List<Map<String, dynamic>> places) {
-    // Filter out any completed routes.
-    final remainingPlaces = places.where((place) {
-      return place["completed"] != true;
-    }).toList();
+  Widget _buildDaySection(
+      String day,
+      List<Map<String, dynamic>> places,
+      double screenWidth,
+      double screenHeight,
+      TextStyle titleStyle,
+      TextStyle placeStyle,
+      ) {
+    final remaining = places.where((p) => p['completed'] != true).toList();
+    final containerPadding = screenWidth * .04;
+    final verticalSpace = screenHeight * .01;
 
     return GestureDetector(
       onTap: () async {
-        // Navigate to MapScreen with the remaining places for the day.
         await Navigator.push(
           context,
           MaterialPageRoute(
-            builder: (context) => MapScreen(
+            builder: (_) => MapScreen(
               day: day,
-              locations: remainingPlaces,
+              locations: remaining,
               truckName: widget.assignedTruck.split(' - ').first,
               truckId: widget.truckId,
+              driverFullName: widget.driverFullName,
             ),
           ),
         );
-        // After returning from MapScreen, refresh the data.
         _refreshData();
       },
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
+        padding: EdgeInsets.symmetric(
+          vertical: verticalSpace,
+          horizontal: containerPadding,
+        ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            Text(
-              day,
-              style: const TextStyle(
-                fontWeight: FontWeight.bold,
-                fontSize: 20,
-                color: Colors.black,
-              ),
-            ),
-            const SizedBox(height: 8),
+            Text(day, style: titleStyle),
+            SizedBox(height: verticalSpace),
             Container(
               width: double.infinity,
               decoration: BoxDecoration(
                 color: Colors.green,
                 border: Border.all(color: Colors.grey),
-                borderRadius: BorderRadius.circular(12),
+                borderRadius: BorderRadius.circular(screenWidth * .02),
               ),
-              padding: const EdgeInsets.all(12.0),
-              child: remainingPlaces.isEmpty
-                  ? const Text(
-                "No routes available.",
-                style: TextStyle(color: Colors.white, fontSize: 16),
-              )
+              padding: EdgeInsets.all(containerPadding),
+              child: remaining.isEmpty
+                  ? Text("No routes available.", style: placeStyle)
                   : Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
-                children: remainingPlaces
-                    .map((place) => Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 4.0),
-                  child: Text(
-                    place['name'] ?? '',
-                    style: const TextStyle(
-                        color: Colors.white, fontSize: 16),
-                  ),
-                ))
-                    .toList(),
+                children: remaining.map((p) {
+                  return Padding(
+                    padding: EdgeInsets.symmetric(vertical: verticalSpace / 2),
+                    child: Text(p['name'] ?? '', style: placeStyle),
+                  );
+                }).toList(),
               ),
             ),
           ],
@@ -211,9 +169,29 @@ class _AssignedRoutesState extends State<AssignedRoutes> {
 
   @override
   Widget build(BuildContext context) {
+    // Responsive sizing
+    final screenWidth = MediaQuery.of(context).size.width;
+    final screenHeight = MediaQuery.of(context).size.height;
+
+    // TextStyles
+    final headerStyle = TextStyle(
+      fontSize: screenWidth * .055,
+      fontWeight: FontWeight.bold,
+      color: Colors.green,
+    );
+    final sectionTitleStyle = TextStyle(
+      fontSize: screenWidth * .05,
+      fontWeight: FontWeight.bold,
+      color: Colors.black,
+    );
+    final placeTextStyle = TextStyle(
+      fontSize: screenWidth * .045,
+      color: Colors.white,
+    );
+
     final todayIndex = DateTime.now().weekday - 1;
-    final currentDay = _daysOrder[todayIndex];
-    final todaySchedule = _schedules[currentDay] ?? [];
+    final today = _daysOrder[todayIndex];
+    final todayPlaces = _schedules[today] ?? [];
     final upcomingDays = List.generate(
       6,
           (i) => _daysOrder[(todayIndex + i + 1) % _daysOrder.length],
@@ -222,46 +200,46 @@ class _AssignedRoutesState extends State<AssignedRoutes> {
     return Scaffold(
       backgroundColor: Colors.white,
       appBar: AppBar(
-        automaticallyImplyLeading: false,
-        centerTitle: true,
         backgroundColor: Colors.white,
         elevation: 0,
-        shadowColor: Colors.transparent,
-        scrolledUnderElevation: 0,
+        centerTitle: true,
         iconTheme: const IconThemeData(color: Colors.green),
         title: const Text(
           "Assigned Routes",
           style: TextStyle(
-            fontWeight: FontWeight.bold,
             color: Colors.green,
+            fontWeight: FontWeight.bold,
             fontSize: 24,
           ),
         ),
         actions: [
-          IconButton(
-            padding: const EdgeInsets.only(right: 16.0),
-            icon: CircleAvatar(
-              radius: 20,
-              backgroundImage: NetworkImage(_driverProfileImgUrl),
-              backgroundColor: Colors.grey,
-            ),
-            onPressed: () {
-              Navigator.push(
-                context,
-                MaterialPageRoute(
-                  builder: (context) => ProfileScreen(
-                    driverId: widget.driverId,
-                    driverProfileImgUrl: _driverProfileImgUrl,
-                    driverUsername: widget.driverUsername,
-                    driverFullName: widget.driverFullName,
-                    assignedTruck: widget.assignedTruck,
-                    truckId: widget.truckId,
-                    schedules: _schedules,
+          Padding(
+            padding: EdgeInsets.only(right: screenWidth * .04),
+            child: GestureDetector(
+              onTap: () {
+                // navigate to profile
+                Navigator.push(
+                  context,
+                  MaterialPageRoute(
+                    builder: (_) => ProfileScreen(
+                      driverId: widget.driverId,
+                      driverProfileImgUrl: _driverProfileImgUrl,
+                      driverUsername: widget.driverUsername,
+                      driverFullName: widget.driverFullName,
+                      assignedTruck: widget.assignedTruck,
+                      truckId: widget.truckId,
+                      schedules: _schedules,
+                    ),
                   ),
-                ),
-              );
-            },
-          ),
+                );
+              },
+              child: CircleAvatar(
+                radius: screenWidth * .06,
+                backgroundImage: NetworkImage(_driverProfileImgUrl),
+                backgroundColor: Colors.grey.shade300,
+              ),
+            ),
+          )
         ],
       ),
       body: RefreshIndicator(
@@ -269,32 +247,37 @@ class _AssignedRoutesState extends State<AssignedRoutes> {
         child: ListView(
           children: [
             Padding(
-              padding:
-              const EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
-              child: Text(
-                "Schedule for Today ($currentDay)",
-                style: const TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 22,
-                    color: Colors.green),
+              padding: EdgeInsets.symmetric(
+                vertical: screenHeight * .015,
+                horizontal: screenWidth * .04,
               ),
+              child: Text("Schedule for Today ($today)", style: headerStyle),
             ),
-            _buildDaySection(currentDay, todaySchedule),
-            const SizedBox(height: 16),
-            const Padding(
-              padding: EdgeInsets.symmetric(vertical: 8.0, horizontal: 16.0),
-              child: Text(
-                "Upcoming Schedule",
-                style: TextStyle(
-                    fontWeight: FontWeight.bold,
-                    fontSize: 22,
-                    color: Colors.green),
+            _buildDaySection(
+              today,
+              todayPlaces,
+              screenWidth,
+              screenHeight,
+              sectionTitleStyle,
+              placeTextStyle,
+            ),
+            SizedBox(height: screenHeight * .02),
+            Padding(
+              padding: EdgeInsets.symmetric(
+                vertical: screenHeight * .015,
+                horizontal: screenWidth * .04,
               ),
+              child: Text("Upcoming Schedule", style: headerStyle),
             ),
-            ...upcomingDays.map((day) {
-              final scheduleForDay = _schedules[day] ?? [];
-              return _buildDaySection(day, scheduleForDay);
-            }).toList(),
+            ...upcomingDays.map((d) => _buildDaySection(
+              d,
+              _schedules[d] ?? [],
+              screenWidth,
+              screenHeight,
+              sectionTitleStyle,
+              placeTextStyle,
+            )),
+            SizedBox(height: screenHeight * .05),
           ],
         ),
       ),
